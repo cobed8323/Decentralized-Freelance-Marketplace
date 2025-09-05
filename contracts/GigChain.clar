@@ -8,6 +8,7 @@
 
 (define-data-var next-gig-id uint u1)
 (define-data-var next-bid-id uint u1)
+(define-data-var next-milestone-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
 
 (define-map gigs uint {
@@ -51,6 +52,24 @@
 
 (define-map escrow-balances uint uint)
 (define-map platform-earnings principal uint)
+
+(define-map milestones uint {
+    gig-id: uint,
+    freelancer: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    amount: uint,
+    deadline: uint,
+    status: (string-ascii 20),
+    submitted-at: (optional uint),
+    approved-at: (optional uint)
+})
+
+(define-map milestone-submissions uint {
+    milestone-id: uint,
+    deliverable-description: (string-ascii 500),
+    submitted-at: uint
+})
 
 (define-public (create-gig (title (string-ascii 100)) (description (string-ascii 500)) (budget uint) (deadline uint))
     (let ((gig-id (var-get next-gig-id)))
@@ -256,4 +275,114 @@
 
 (define-read-only (get-next-bid-id)
     (var-get next-bid-id)
+)
+
+(define-public (create-milestone (gig-id uint) (title (string-ascii 100)) (description (string-ascii 300)) (amount uint) (deadline uint))
+    (let ((gig (unwrap! (map-get? gigs gig-id) ERR_NOT_FOUND))
+          (bid-id (unwrap! (get selected-bid gig) ERR_NOT_FOUND))
+          (bid (unwrap! (map-get? bids bid-id) ERR_NOT_FOUND))
+          (milestone-id (var-get next-milestone-id)))
+        (asserts! (is-eq tx-sender (get freelancer bid)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status gig) "in-progress") ERR_INVALID_STATE)
+        (asserts! (> amount u0) ERR_INVALID_STATE)
+        (asserts! (> deadline (unwrap! (get-stacks-block-info? time (- stacks-block-height u1)) ERR_NOT_FOUND)) ERR_INVALID_STATE)
+        (map-set milestones milestone-id {
+            gig-id: gig-id,
+            freelancer: tx-sender,
+            title: title,
+            description: description,
+            amount: amount,
+            deadline: deadline,
+            status: "pending",
+            submitted-at: none,
+            approved-at: none
+        })
+        (var-set next-milestone-id (+ milestone-id u1))
+        (ok milestone-id)
+    )
+)
+
+(define-public (submit-milestone (milestone-id uint) (deliverable-description (string-ascii 500)))
+    (let ((milestone (unwrap! (map-get? milestones milestone-id) ERR_NOT_FOUND))
+          (current-time (unwrap! (get-stacks-block-info? time (- stacks-block-height u1)) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get freelancer milestone)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status milestone) "pending") ERR_INVALID_STATE)
+        (map-set milestones milestone-id (merge milestone {
+            status: "submitted",
+            submitted-at: (some current-time)
+        }))
+        (map-set milestone-submissions milestone-id {
+            milestone-id: milestone-id,
+            deliverable-description: deliverable-description,
+            submitted-at: current-time
+        })
+        (ok true)
+    )
+)
+
+(define-public (approve-milestone (milestone-id uint))
+    (let ((milestone (unwrap! (map-get? milestones milestone-id) ERR_NOT_FOUND))
+          (gig (unwrap! (map-get? gigs (get gig-id milestone)) ERR_NOT_FOUND))
+          (escrow-amount (unwrap! (map-get? escrow-balances (get gig-id milestone)) ERR_NOT_FOUND))
+          (platform-fee (/ (* (get amount milestone) (var-get platform-fee-percentage)) u10000))
+          (freelancer-payment (- (get amount milestone) platform-fee))
+          (remaining-escrow (- escrow-amount (get amount milestone)))
+          (current-time (unwrap! (get-stacks-block-info? time (- stacks-block-height u1)) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get client gig)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status milestone) "submitted") ERR_INVALID_STATE)
+        (asserts! (>= escrow-amount (get amount milestone)) ERR_INSUFFICIENT_FUNDS)
+        (try! (as-contract (stx-transfer? freelancer-payment tx-sender (get freelancer milestone))))
+        (try! (as-contract (stx-transfer? platform-fee tx-sender CONTRACT_OWNER)))
+        (map-set milestones milestone-id (merge milestone {
+            status: "completed",
+            approved-at: (some current-time)
+        }))
+        (map-set escrow-balances (get gig-id milestone) remaining-escrow)
+        (update-user-profile (get freelancer milestone) u2 u0 u0 freelancer-payment u0)
+        (ok true)
+    )
+)
+
+(define-public (reject-milestone (milestone-id uint) (feedback (string-ascii 300)))
+    (let ((milestone (unwrap! (map-get? milestones milestone-id) ERR_NOT_FOUND))
+          (gig (unwrap! (map-get? gigs (get gig-id milestone)) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get client gig)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status milestone) "submitted") ERR_INVALID_STATE)
+        (map-set milestones milestone-id (merge milestone {
+            status: "revision-needed",
+            submitted-at: none
+        }))
+        (map-delete milestone-submissions milestone-id)
+        (ok feedback)
+    )
+)
+
+(define-public (resubmit-milestone (milestone-id uint) (deliverable-description (string-ascii 500)))
+    (let ((milestone (unwrap! (map-get? milestones milestone-id) ERR_NOT_FOUND))
+          (current-time (unwrap! (get-stacks-block-info? time (- stacks-block-height u1)) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get freelancer milestone)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status milestone) "revision-needed") ERR_INVALID_STATE)
+        (map-set milestones milestone-id (merge milestone {
+            status: "submitted",
+            submitted-at: (some current-time)
+        }))
+        (map-set milestone-submissions milestone-id {
+            milestone-id: milestone-id,
+            deliverable-description: deliverable-description,
+            submitted-at: current-time
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+    (map-get? milestones milestone-id)
+)
+
+(define-read-only (get-milestone-submission (milestone-id uint))
+    (map-get? milestone-submissions milestone-id)
+)
+
+(define-read-only (get-next-milestone-id)
+    (var-get next-milestone-id)
 )
