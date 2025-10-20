@@ -5,6 +5,9 @@
 (define-constant ERR_INSUFFICIENT_FUNDS (err u402))
 (define-constant ERR_ALREADY_EXISTS (err u409))
 (define-constant ERR_EXPIRED (err u410))
+(define-constant ERR_INVALID_RATING (err u411))
+(define-constant ERR_REVIEW_EXISTS (err u412))
+(define-constant ERR_INVALID_REVIEWER (err u413))
 
 (define-data-var next-gig-id uint u1)
 (define-data-var next-bid-id uint u1)
@@ -69,6 +72,24 @@
     milestone-id: uint,
     deliverable-description: (string-ascii 500),
     submitted-at: uint
+})
+
+(define-map freelancer-skills principal (list 10 (string-ascii 50)))
+(define-map gig-categories uint (string-ascii 50))
+(define-map skill-reputation {freelancer: principal, skill: (string-ascii 50)} uint)
+
+(define-map gig-reviews uint {
+    freelancer: principal,
+    client: principal,
+    rating: uint,
+    comment: (string-ascii 300),
+    created-at: uint
+})
+
+(define-map freelancer-ratings principal {
+    total-reviews: uint,
+    total-rating-points: uint,
+    avg-rating: uint
 })
 
 (define-public (create-gig (title (string-ascii 100)) (description (string-ascii 500)) (budget uint) (deadline uint))
@@ -385,4 +406,93 @@
 
 (define-read-only (get-next-milestone-id)
     (var-get next-milestone-id)
+)
+
+(define-public (add-freelancer-skill (skill (string-ascii 50)))
+    (let ((current-skills (default-to (list) (map-get? freelancer-skills tx-sender))))
+        (asserts! (< (len current-skills) u10) ERR_INVALID_STATE)
+        (map-set freelancer-skills tx-sender (unwrap-panic (as-max-len? (append current-skills skill) u10)))
+        (ok true)
+    )
+)
+
+(define-public (remove-freelancer-skill (skill (string-ascii 50)))
+    (let ((current-skills (default-to (list) (map-get? freelancer-skills tx-sender))))
+        (map-set freelancer-skills tx-sender (unwrap-panic (as-max-len? (filter (lambda (s) (not (is-eq s skill))) current-skills) u10)))
+        (ok true)
+    )
+)
+
+(define-public (set-gig-category (gig-id uint) (category (string-ascii 50)))
+    (let ((gig (unwrap! (map-get? gigs gig-id) ERR_NOT_FOUND)))
+        (asserts! (is-eq tx-sender (get client gig)) ERR_UNAUTHORIZED)
+        (map-set gig-categories gig-id category)
+        (ok true)
+    )
+)
+
+(define-public (update-skill-reputation (freelancer principal) (skill (string-ascii 50)) (points uint))
+    (let ((current-rep (default-to u0 (map-get? skill-reputation {freelancer: freelancer, skill: skill}))))
+        (map-set skill-reputation {freelancer: freelancer, skill: skill} (+ current-rep points))
+        (ok true)
+    )
+)
+
+(define-read-only (get-freelancer-skills (freelancer principal))
+    (default-to (list) (map-get? freelancer-skills freelancer))
+)
+
+(define-read-only (get-gig-category (gig-id uint))
+    (map-get? gig-categories gig-id)
+)
+
+(define-read-only (get-skill-reputation (freelancer principal) (skill (string-ascii 50)))
+    (default-to u0 (map-get? skill-reputation {freelancer: freelancer, skill: skill}))
+)
+
+(define-public (submit-gig-review (gig-id uint) (rating uint) (comment (string-ascii 300)))
+    (let ((gig (unwrap! (map-get? gigs gig-id) ERR_NOT_FOUND))
+          (submission (unwrap! (map-get? work-submissions gig-id) ERR_NOT_FOUND))
+          (bid-id (unwrap! (get selected-bid gig) ERR_NOT_FOUND))
+          (bid (unwrap! (map-get? bids bid-id) ERR_NOT_FOUND))
+          (existing-review (map-get? gig-reviews gig-id))
+          (freelancer (get freelancer submission))
+          (current-ratings (default-to {
+              total-reviews: u0,
+              total-rating-points: u0,
+              avg-rating: u0
+          } (map-get? freelancer-ratings freelancer)))
+          (new-total-reviews (+ (get total-reviews current-ratings) u1))
+          (new-total-points (+ (get total-rating-points current-ratings) rating))
+          (new-avg-rating (/ new-total-points new-total-reviews)))
+        (asserts! (is-eq tx-sender (get client gig)) ERR_INVALID_REVIEWER)
+        (asserts! (is-eq (get status gig) "completed") ERR_INVALID_STATE)
+        (asserts! (is-none existing-review) ERR_REVIEW_EXISTS)
+        (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+        (map-set gig-reviews gig-id {
+            freelancer: freelancer,
+            client: tx-sender,
+            rating: rating,
+            comment: comment,
+            created-at: (unwrap! (get-stacks-block-info? time (- stacks-block-height u1)) ERR_NOT_FOUND)
+        })
+        (map-set freelancer-ratings freelancer {
+            total-reviews: new-total-reviews,
+            total-rating-points: new-total-points,
+            avg-rating: new-avg-rating
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-gig-review (gig-id uint))
+    (map-get? gig-reviews gig-id)
+)
+
+(define-read-only (get-freelancer-ratings (freelancer principal))
+    (default-to {
+        total-reviews: u0,
+        total-rating-points: u0,
+        avg-rating: u0
+    } (map-get? freelancer-ratings freelancer))
 )
